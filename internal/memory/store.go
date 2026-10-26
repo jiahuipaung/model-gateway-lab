@@ -2,9 +2,6 @@ package memory
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"sort"
 	"sync"
 	"time"
@@ -98,7 +95,7 @@ func (s *Store) CompletePoll(_ context.Context, completion controlplane.PollComp
 	s.tasks[completion.TaskID] = record
 	delete(s.pollLeases, completion.TaskID)
 	if record.ExecutionState == task.ExecutionSucceeded || record.ExecutionState == task.ExecutionFailed {
-		event := terminalEvent(record)
+		event := controlplane.TerminalEvent(record)
 		s.events[event.ID] = event
 		if _, exists := s.deliveries[event.ID]; !exists {
 			s.deliveries[event.ID] = delivery{state: "PENDING"}
@@ -154,32 +151,6 @@ func (s *Store) ReleaseOutbox(_ context.Context, eventID, owner string) error {
 	d.lease = lease{}
 	s.deliveries[eventID] = d
 	return nil
-}
-
-func terminalEvent(record task.Task) controlplane.Event {
-	type payload struct {
-		TaskID          string               `json:"task_id"`
-		SubmissionState task.SubmissionState `json:"submission_state"`
-		ExecutionState  task.ExecutionState  `json:"execution_state"`
-		OutputRef       string               `json:"output_ref,omitempty"`
-		FailureCode     string               `json:"failure_code,omitempty"`
-	}
-	body, err := json.Marshal(payload{
-		TaskID: record.ID, SubmissionState: record.SubmissionState, ExecutionState: record.ExecutionState,
-		OutputRef: record.OutputRef, FailureCode: record.FailureCode,
-	})
-	if err != nil {
-		panic("terminal event payload is JSON-safe: " + err.Error())
-	}
-	sum := sha256.Sum256([]byte(record.ID + "\x00" + string(record.ExecutionState)))
-	eventType := "task.succeeded"
-	if record.ExecutionState == task.ExecutionFailed {
-		eventType = "task.failed"
-	}
-	return controlplane.Event{
-		ID: "evt_" + hex.EncodeToString(sum[:16]), Type: eventType, TaskID: record.ID,
-		TenantID: record.TenantID, Payload: body, CreatedAt: record.UpdatedAt,
-	}
 }
 
 func (s *Store) ClaimSubmission(_ context.Context, owner string, now time.Time, ttl time.Duration) (controlplane.SubmissionClaim, bool, error) {

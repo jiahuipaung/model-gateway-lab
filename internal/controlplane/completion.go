@@ -2,11 +2,41 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/jiahuipaung/model-gateway-lab/internal/provider"
+	"github.com/jiahuipaung/model-gateway-lab/internal/task"
 )
+
+func TerminalEvent(record task.Task) Event {
+	type payload struct {
+		TaskID          string               `json:"task_id"`
+		SubmissionState task.SubmissionState `json:"submission_state"`
+		ExecutionState  task.ExecutionState  `json:"execution_state"`
+		OutputRef       string               `json:"output_ref,omitempty"`
+		FailureCode     string               `json:"failure_code,omitempty"`
+	}
+	body, err := json.Marshal(payload{
+		TaskID: record.ID, SubmissionState: record.SubmissionState, ExecutionState: record.ExecutionState,
+		OutputRef: record.OutputRef, FailureCode: record.FailureCode,
+	})
+	if err != nil {
+		panic("terminal event payload is JSON-safe: " + err.Error())
+	}
+	sum := sha256.Sum256([]byte(record.ID + "\x00" + string(record.ExecutionState)))
+	eventType := "task.succeeded"
+	if record.ExecutionState == task.ExecutionFailed {
+		eventType = "task.failed"
+	}
+	return Event{
+		ID: "evt_" + hex.EncodeToString(sum[:16]), Type: eventType, TaskID: record.ID,
+		TenantID: record.TenantID, Payload: body, CreatedAt: record.UpdatedAt,
+	}
+}
 
 type Poller struct {
 	repository    Repository
