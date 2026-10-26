@@ -2,6 +2,9 @@ package memory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"sync"
 	"time"
@@ -16,11 +19,20 @@ type Store struct {
 	idempotencyIDs map[string]string
 	submitLeases   map[string]lease
 	unknownLeases  map[string]lease
+	pollLeases     map[string]lease
+	events         map[string]controlplane.Event
+	deliveries     map[string]delivery
 }
 
 type lease struct {
 	owner     string
 	expiresAt time.Time
+}
+
+type delivery struct {
+	state    string
+	lease    lease
+	attempts int
 }
 
 func NewStore() *Store {
@@ -29,6 +41,144 @@ func NewStore() *Store {
 		idempotencyIDs: make(map[string]string),
 		submitLeases:   make(map[string]lease),
 		unknownLeases:  make(map[string]lease),
+		pollLeases:     make(map[string]lease),
+		events:         make(map[string]controlplane.Event),
+		deliveries:     make(map[string]delivery),
+	}
+}
+
+func (s *Store) ClaimPoll(_ context.Context, owner string, now time.Time, ttl time.Duration) (controlplane.PollClaim, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, id := range s.orderedTaskIDs() {
+		record := s.tasks[id]
+		currentLease := s.pollLeases[id]
+		claimableState := record.SubmissionState == task.SubmissionConfirmed &&
+			(record.ExecutionState == task.ExecutionQueued || record.ExecutionState == task.ExecutionRunning)
+		if !claimableState || currentLease.expiresAt.After(now) {
+			continue
+		}
+		s.pollLeases[id] = lease{owner: owner, expiresAt: now.Add(ttl)}
+		return controlplane.PollClaim{Task: record, LeaseOwner: owner}, true, nil
+	}
+	return controlplane.PollClaim{}, false, nil
+}
+
+func (s *Store) CompletePoll(_ context.Context, completion controlplane.PollCompletion) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	record, ok := s.tasks[completion.TaskID]
+	currentLease := s.pollLeases[completion.TaskID]
+	if !ok || currentLease.owner == "" || currentLease.owner != completion.LeaseOwner || record.SubmissionState != task.SubmissionConfirmed {
+		return controlplane.ErrLeaseLost
+	}
+
+	switch completion.Outcome {
+	case controlplane.PollObservedQueued:
+		record.ExecutionState = task.ExecutionQueued
+	case controlplane.PollObservedRunning:
+		record.ExecutionState = task.ExecutionRunning
+	case controlplane.PollObservedSucceeded:
+		record.ExecutionState = task.ExecutionSucceeded
+		record.OutputRef = completion.OutputRef
+	case controlplane.PollObservedFailed:
+		record.ExecutionState = task.ExecutionFailed
+		record.FailureCode = completion.FailureCode
+	case controlplane.PollObservationRetry:
+		delete(s.pollLeases, completion.TaskID)
+		return nil
+	default:
+		return controlplane.ErrInvalidRequest
+	}
+
+	record.Version++
+	record.UpdatedAt = time.Now().UTC()
+	s.tasks[completion.TaskID] = record
+	delete(s.pollLeases, completion.TaskID)
+	if record.ExecutionState == task.ExecutionSucceeded || record.ExecutionState == task.ExecutionFailed {
+		event := terminalEvent(record)
+		s.events[event.ID] = event
+		if _, exists := s.deliveries[event.ID]; !exists {
+			s.deliveries[event.ID] = delivery{state: "PENDING"}
+		}
+	}
+	return nil
+}
+
+func (s *Store) ClaimOutbox(_ context.Context, owner string, now time.Time, ttl time.Duration) (controlplane.OutboxClaim, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]string, 0, len(s.events))
+	for id := range s.events {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		d := s.deliveries[id]
+		if d.state == "SENT" || (d.state == "SENDING" && d.lease.expiresAt.After(now)) {
+			continue
+		}
+		d.state = "SENDING"
+		d.lease = lease{owner: owner, expiresAt: now.Add(ttl)}
+		d.attempts++
+		s.deliveries[id] = d
+		return controlplane.OutboxClaim{Event: s.events[id], LeaseOwner: owner, Attempts: d.attempts}, true, nil
+	}
+	return controlplane.OutboxClaim{}, false, nil
+}
+
+func (s *Store) MarkOutboxSent(_ context.Context, eventID, owner string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.deliveries[eventID]
+	if !ok || d.state != "SENDING" || d.lease.owner != owner {
+		return controlplane.ErrLeaseLost
+	}
+	d.state = "SENT"
+	d.lease = lease{}
+	s.deliveries[eventID] = d
+	return nil
+}
+
+func (s *Store) ReleaseOutbox(_ context.Context, eventID, owner string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.deliveries[eventID]
+	if !ok || d.state != "SENDING" || d.lease.owner != owner {
+		return controlplane.ErrLeaseLost
+	}
+	d.state = "PENDING"
+	d.lease = lease{}
+	s.deliveries[eventID] = d
+	return nil
+}
+
+func terminalEvent(record task.Task) controlplane.Event {
+	type payload struct {
+		TaskID          string               `json:"task_id"`
+		SubmissionState task.SubmissionState `json:"submission_state"`
+		ExecutionState  task.ExecutionState  `json:"execution_state"`
+		OutputRef       string               `json:"output_ref,omitempty"`
+		FailureCode     string               `json:"failure_code,omitempty"`
+	}
+	body, err := json.Marshal(payload{
+		TaskID: record.ID, SubmissionState: record.SubmissionState, ExecutionState: record.ExecutionState,
+		OutputRef: record.OutputRef, FailureCode: record.FailureCode,
+	})
+	if err != nil {
+		panic("terminal event payload is JSON-safe: " + err.Error())
+	}
+	sum := sha256.Sum256([]byte(record.ID + "\x00" + string(record.ExecutionState)))
+	eventType := "task.succeeded"
+	if record.ExecutionState == task.ExecutionFailed {
+		eventType = "task.failed"
+	}
+	return controlplane.Event{
+		ID: "evt_" + hex.EncodeToString(sum[:16]), Type: eventType, TaskID: record.ID,
+		TenantID: record.TenantID, Payload: body, CreatedAt: record.UpdatedAt,
 	}
 }
 

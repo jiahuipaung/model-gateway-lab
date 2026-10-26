@@ -20,10 +20,22 @@ type lookupBehavior struct {
 	err    error
 }
 
+type pollBehavior struct {
+	result provider.PollResult
+	err    error
+}
+
 type Provider struct {
 	mu      sync.Mutex
 	submits []submitBehavior
 	lookups []lookupBehavior
+	polls   []pollBehavior
+}
+
+func (p *Provider) PushPoll(result provider.PollResult, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.polls = append(p.polls, pollBehavior{result: result, err: err})
 }
 
 func New() *Provider {
@@ -65,5 +77,12 @@ func (p *Provider) Lookup(context.Context, string) (provider.LookupResult, error
 }
 
 func (p *Provider) Poll(context.Context, string) (provider.PollResult, error) {
-	return provider.PollResult{}, ErrNoBehavior
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.polls) == 0 {
+		return provider.PollResult{}, ErrNoBehavior
+	}
+	next := p.polls[0]
+	p.polls = p.polls[1:]
+	return next.result, next.err
 }
