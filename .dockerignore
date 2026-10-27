@@ -1,0 +1,6 @@
+.git
+.gitignore
+.worktrees
+.superpowers
+bin
+coverage.out
