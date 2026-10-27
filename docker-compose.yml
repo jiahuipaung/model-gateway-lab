@@ -1,4 +1,21 @@
 services:
+  gateway:
+    build: .
+    environment:
+      DATABASE_URL: postgres://gateway:gateway@postgres:5432/model_gateway?sslmode=disable
+      HTTP_ADDR: :8080
+      WORKER_INTERVAL: 100ms
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
   postgres:
     image: postgres:16-alpine
     environment:

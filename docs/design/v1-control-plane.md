@@ -16,8 +16,8 @@ It may use general ideas—idempotency keys, leases, reconciliation, state machi
 
 ```text
 POST /v1/tasks
-  -> idempotency ledger + task + submit command in one transaction
-  -> submission worker claims command with a lease
+  -> idempotency ledger + task with durable submit intent in one transaction
+  -> submission worker claims the intent with a lease
   -> provider returns accepted, definite rejection, or unknown outcome
   -> reconciler resolves unknown submissions by provider request key
   -> poller advances confirmed tasks to a terminal execution state
@@ -81,7 +81,7 @@ Each transition is conditional on the current state and version. A stale worker 
 ## 6. Core invariants
 
 1. `(tenant_id, idempotency_key)` is unique and stores a SHA-256 digest of the canonical request.
-2. Creating the request ledger, task, and submit command is one database transaction.
+2. Creating the request ledger and task with its durable submit intent is one database transaction.
 3. A command or task claim records `lease_owner` and `lease_expires_at`; only the current owner may complete it.
 4. A submission timeout after bytes may have reached the provider is `UNKNOWN`, never a definite failure.
 5. Reconciliation uses a stable `provider_request_key`. “Found” confirms the task; “proven absent” requeues it; “inconclusive” keeps it unknown.
