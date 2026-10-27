@@ -16,6 +16,7 @@ var tenantPattern = regexp.MustCompile(`^[a-z0-9_-]{1,64}$`)
 
 type Service struct {
 	repository Repository
+	providers  map[string]struct{}
 	now        func() time.Time
 	newID      func() string
 }
@@ -31,9 +32,14 @@ type CreateTaskResult struct {
 	Replayed bool      `json:"replayed"`
 }
 
-func NewService(repository Repository) *Service {
+func NewService(repository Repository, configuredProviders ...string) *Service {
+	providers := make(map[string]struct{}, len(configuredProviders))
+	for _, name := range configuredProviders {
+		providers[name] = struct{}{}
+	}
 	return &Service{
 		repository: repository,
+		providers:  providers,
 		now:        time.Now,
 		newID:      newUUID,
 	}
@@ -42,6 +48,9 @@ func NewService(repository Repository) *Service {
 func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (CreateTaskResult, error) {
 	if err := validateCreateInput(input); err != nil {
 		return CreateTaskResult{}, err
+	}
+	if _, ok := s.providers[input.Spec.Provider]; !ok {
+		return CreateTaskResult{}, fmt.Errorf("%w: provider is not configured", ErrInvalidRequest)
 	}
 
 	now := s.now().UTC()

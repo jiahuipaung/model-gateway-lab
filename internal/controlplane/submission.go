@@ -3,7 +3,6 @@ package controlplane
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/jiahuipaung/model-gateway-lab/internal/provider"
@@ -29,7 +28,11 @@ func (w *SubmissionWorker) RunOnce(ctx context.Context) (bool, error) {
 
 	client, ok := w.providers[claim.Task.Spec.Provider]
 	if !ok {
-		return true, fmt.Errorf("provider %q is not configured", claim.Task.Spec.Provider)
+		completion := SubmissionCompletion{
+			TaskID: claim.Task.ID, LeaseOwner: claim.LeaseOwner,
+			Outcome: SubmissionDenied, FailureCode: "provider_not_configured",
+		}
+		return true, w.repository.CompleteSubmission(ctx, completion)
 	}
 
 	result, submitErr := client.Submit(ctx, provider.SubmitRequest{

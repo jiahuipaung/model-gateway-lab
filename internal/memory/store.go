@@ -17,6 +17,7 @@ type Store struct {
 	submitLeases   map[string]lease
 	unknownLeases  map[string]lease
 	pollLeases     map[string]lease
+	pollAfter      map[string]time.Time
 	events         map[string]controlplane.Event
 	deliveries     map[string]delivery
 }
@@ -27,9 +28,10 @@ type lease struct {
 }
 
 type delivery struct {
-	state    string
-	lease    lease
-	attempts int
+	state       string
+	lease       lease
+	attempts    int
+	availableAt time.Time
 }
 
 func NewStore() *Store {
@@ -39,6 +41,7 @@ func NewStore() *Store {
 		submitLeases:   make(map[string]lease),
 		unknownLeases:  make(map[string]lease),
 		pollLeases:     make(map[string]lease),
+		pollAfter:      make(map[string]time.Time),
 		events:         make(map[string]controlplane.Event),
 		deliveries:     make(map[string]delivery),
 	}
@@ -48,16 +51,17 @@ func (s *Store) ClaimPoll(_ context.Context, owner string, now time.Time, ttl ti
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, id := range s.orderedTaskIDs() {
+	for _, id := range s.orderedPollTaskIDs() {
 		record := s.tasks[id]
 		currentLease := s.pollLeases[id]
 		claimableState := record.SubmissionState == task.SubmissionConfirmed &&
 			(record.ExecutionState == task.ExecutionQueued || record.ExecutionState == task.ExecutionRunning)
-		if !claimableState || currentLease.expiresAt.After(now) {
+		if !claimableState || currentLease.expiresAt.After(now) || s.pollAfter[id].After(now) {
 			continue
 		}
-		s.pollLeases[id] = lease{owner: owner, expiresAt: now.Add(ttl)}
-		return controlplane.PollClaim{Task: record, LeaseOwner: owner}, true, nil
+		token := controlplane.NewClaimToken(owner)
+		s.pollLeases[id] = lease{owner: token, expiresAt: now.Add(ttl)}
+		return controlplane.PollClaim{Task: record, LeaseOwner: token}, true, nil
 	}
 	return controlplane.PollClaim{}, false, nil
 }
@@ -74,17 +78,34 @@ func (s *Store) CompletePoll(_ context.Context, completion controlplane.PollComp
 
 	switch completion.Outcome {
 	case controlplane.PollObservedQueued:
+		if !record.ExecutionState.CanTransitionTo(task.ExecutionQueued) {
+			delete(s.pollLeases, completion.TaskID)
+			return nil
+		}
 		record.ExecutionState = task.ExecutionQueued
 	case controlplane.PollObservedRunning:
+		if !record.ExecutionState.CanTransitionTo(task.ExecutionRunning) {
+			delete(s.pollLeases, completion.TaskID)
+			return nil
+		}
 		record.ExecutionState = task.ExecutionRunning
 	case controlplane.PollObservedSucceeded:
+		if !record.ExecutionState.CanTransitionTo(task.ExecutionSucceeded) {
+			delete(s.pollLeases, completion.TaskID)
+			return nil
+		}
 		record.ExecutionState = task.ExecutionSucceeded
 		record.OutputRef = completion.OutputRef
 	case controlplane.PollObservedFailed:
+		if !record.ExecutionState.CanTransitionTo(task.ExecutionFailed) {
+			delete(s.pollLeases, completion.TaskID)
+			return nil
+		}
 		record.ExecutionState = task.ExecutionFailed
 		record.FailureCode = completion.FailureCode
 	case controlplane.PollObservationRetry:
 		delete(s.pollLeases, completion.TaskID)
+		s.pollAfter[completion.TaskID] = completion.NextPollAt
 		return nil
 	default:
 		return controlplane.ErrInvalidRequest
@@ -94,6 +115,11 @@ func (s *Store) CompletePoll(_ context.Context, completion controlplane.PollComp
 	record.UpdatedAt = time.Now().UTC()
 	s.tasks[completion.TaskID] = record
 	delete(s.pollLeases, completion.TaskID)
+	if record.ExecutionState == task.ExecutionQueued || record.ExecutionState == task.ExecutionRunning {
+		s.pollAfter[completion.TaskID] = completion.NextPollAt
+	} else {
+		delete(s.pollAfter, completion.TaskID)
+	}
 	if record.ExecutionState == task.ExecutionSucceeded || record.ExecutionState == task.ExecutionFailed {
 		event := controlplane.TerminalEvent(record)
 		s.events[event.ID] = event
@@ -115,14 +141,15 @@ func (s *Store) ClaimOutbox(_ context.Context, owner string, now time.Time, ttl 
 	sort.Strings(ids)
 	for _, id := range ids {
 		d := s.deliveries[id]
-		if d.state == "SENT" || (d.state == "SENDING" && d.lease.expiresAt.After(now)) {
+		if d.state == "SENT" || d.availableAt.After(now) || (d.state == "SENDING" && d.lease.expiresAt.After(now)) {
 			continue
 		}
 		d.state = "SENDING"
-		d.lease = lease{owner: owner, expiresAt: now.Add(ttl)}
+		token := controlplane.NewClaimToken(owner)
+		d.lease = lease{owner: token, expiresAt: now.Add(ttl)}
 		d.attempts++
 		s.deliveries[id] = d
-		return controlplane.OutboxClaim{Event: s.events[id], LeaseOwner: owner, Attempts: d.attempts}, true, nil
+		return controlplane.OutboxClaim{Event: s.events[id], LeaseOwner: token, Attempts: d.attempts}, true, nil
 	}
 	return controlplane.OutboxClaim{}, false, nil
 }
@@ -140,7 +167,7 @@ func (s *Store) MarkOutboxSent(_ context.Context, eventID, owner string) error {
 	return nil
 }
 
-func (s *Store) ReleaseOutbox(_ context.Context, eventID, owner string) error {
+func (s *Store) ReleaseOutbox(_ context.Context, eventID, owner string, retryAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d, ok := s.deliveries[eventID]
@@ -149,6 +176,7 @@ func (s *Store) ReleaseOutbox(_ context.Context, eventID, owner string) error {
 	}
 	d.state = "PENDING"
 	d.lease = lease{}
+	d.availableAt = retryAt
 	s.deliveries[eventID] = d
 	return nil
 }
@@ -159,20 +187,17 @@ func (s *Store) ClaimSubmission(_ context.Context, owner string, now time.Time, 
 
 	for _, id := range s.orderedTaskIDs() {
 		record := s.tasks[id]
-		currentLease := s.submitLeases[id]
-		claimable := record.SubmissionState == task.SubmissionPending ||
-			(record.SubmissionState == task.SubmissionSubmitting && !currentLease.expiresAt.After(now))
+		claimable := record.SubmissionState == task.SubmissionPending
 		if !claimable {
 			continue
 		}
-		if record.SubmissionState == task.SubmissionPending {
-			record.SubmissionState = task.SubmissionSubmitting
-		}
+		record.SubmissionState = task.SubmissionSubmitting
 		record.Version++
 		record.UpdatedAt = now.UTC()
 		s.tasks[id] = record
-		s.submitLeases[id] = lease{owner: owner, expiresAt: now.Add(ttl)}
-		return controlplane.SubmissionClaim{Task: record, LeaseOwner: owner}, true, nil
+		token := controlplane.NewClaimToken(owner)
+		s.submitLeases[id] = lease{owner: token, expiresAt: now.Add(ttl)}
+		return controlplane.SubmissionClaim{Task: record, LeaseOwner: token}, true, nil
 	}
 	return controlplane.SubmissionClaim{}, false, nil
 }
@@ -217,11 +242,21 @@ func (s *Store) ClaimUnknown(_ context.Context, owner string, now time.Time, ttl
 	for _, id := range s.orderedTaskIDs() {
 		record := s.tasks[id]
 		currentLease := s.unknownLeases[id]
-		if record.SubmissionState != task.SubmissionUnknown || currentLease.expiresAt.After(now) {
+		expiredSubmission := record.SubmissionState == task.SubmissionSubmitting && !s.submitLeases[id].expiresAt.After(now)
+		claimableUnknown := record.SubmissionState == task.SubmissionUnknown && !currentLease.expiresAt.After(now)
+		if !expiredSubmission && !claimableUnknown {
 			continue
 		}
-		s.unknownLeases[id] = lease{owner: owner, expiresAt: now.Add(ttl)}
-		return controlplane.SubmissionClaim{Task: record, LeaseOwner: owner}, true, nil
+		if expiredSubmission {
+			record.SubmissionState = task.SubmissionUnknown
+			record.Version++
+			record.UpdatedAt = now.UTC()
+			s.tasks[id] = record
+			delete(s.submitLeases, id)
+		}
+		token := controlplane.NewClaimToken(owner)
+		s.unknownLeases[id] = lease{owner: token, expiresAt: now.Add(ttl)}
+		return controlplane.SubmissionClaim{Task: record, LeaseOwner: token}, true, nil
 	}
 	return controlplane.SubmissionClaim{}, false, nil
 }
@@ -269,6 +304,18 @@ func (s *Store) orderedTaskIDs() []string {
 			return ids[i] < ids[j]
 		}
 		return left.CreatedAt.Before(right.CreatedAt)
+	})
+	return ids
+}
+
+func (s *Store) orderedPollTaskIDs() []string {
+	ids := s.orderedTaskIDs()
+	sort.SliceStable(ids, func(i, j int) bool {
+		left, right := s.pollAfter[ids[i]], s.pollAfter[ids[j]]
+		if left.Equal(right) {
+			return s.tasks[ids[i]].UpdatedAt.Before(s.tasks[ids[j]].UpdatedAt)
+		}
+		return left.Before(right)
 	})
 	return ids
 }

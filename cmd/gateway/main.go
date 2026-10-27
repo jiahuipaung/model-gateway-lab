@@ -70,9 +70,9 @@ func run() error {
 		return err
 	}
 
-	fake := fakeprovider.NewScenario()
+	fake := fakeprovider.NewScenarioWithState(store)
 	providers := map[string]provider.Provider{"fake-a": fake}
-	service := controlplane.NewService(store)
+	service := controlplane.NewService(store, "fake-a")
 	submitter := controlplane.NewSubmissionWorker(store, providers, "submit-local", 5*time.Second)
 	reconciler := controlplane.NewReconciler(store, providers, "reconcile-local", 5*time.Second)
 	poller := controlplane.NewPoller(store, providers, "poll-local", 5*time.Second)

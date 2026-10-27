@@ -16,11 +16,12 @@ The task row carries the durable submit intent through `PENDING` and `SUBMITTING
 
 | Failure window | Unsafe behavior | v1 behavior | Evidence |
 |---|---|---|---|
-| Two workers scan the same pending task | Both call the provider | PostgreSQL claims one row with `FOR UPDATE SKIP LOCKED` and records an owner plus expiry | `TestSubmissionLeaseTakeoverRejectsStaleOwner` |
-| Worker crashes while holding work | Task remains stuck forever | Another worker may claim after lease expiry | `TestSubmissionClaimIsExclusiveAndExpiredLeaseCanBeTakenOver` |
-| Old worker finishes after takeover | Old result overwrites new state | Completion is conditional on the current lease owner | `TestStalePollOwnerCannotCompleteAfterTakeover` |
+| Two workers scan the same pending task | Both call the provider | PostgreSQL claims one row with `FOR UPDATE SKIP LOCKED` and records a unique attempt token plus expiry | `TestCreateTaskIsAtomicAndIdempotent` |
+| Submit worker crashes after a possible remote side effect | Blind retry creates duplicate paid work | Expiry moves the task to `UNKNOWN`; only a proven `ABSENT` result returns it to `PENDING` | `TestExpiredSubmissionMustReconcileBeforeResubmission`, `TestExpiredSubmissionIsReconciledAndFencedBeforeRetry` |
+| Two processes share the same logical worker name | A stale completion matches the new owner string | Every acquisition receives a new random fencing token | `TestClaimTokensFenceSameLogicalWorkerAfterTakeover`, `TestStalePollOwnerCannotCompleteAfterTakeover` |
+| Old worker finishes after takeover | Old result overwrites new state | Completion is conditional on the current attempt token | `TestStalePollOwnerCannotCompleteAfterTakeover` |
 
-Leases provide ownership, not exactly-once external effects. They prevent concurrent local completion, while provider idempotency and reconciliation handle remote ambiguity.
+Leases provide local ownership, not exactly-once external effects. Fencing prevents stale local completion; reconciliation is what closes the ambiguous remote-submit window.
 
 ## 3. Provider submission ambiguity
 
@@ -42,6 +43,8 @@ The reconciler queries by stable `provider_request_key`:
 
 Evidence: `TestSubmissionWorkerMapsProviderOutcomes` and `TestReconcilerDistinguishesFoundAbsentAndInconclusive`.
 
+The local scenario provider stores its simulated remote state separately in PostgreSQL. A gateway restart can therefore distinguish `FOUND` from `ABSENT` and continue polling unfinished demo tasks. Evidence: `TestScenarioProviderCanRecoverKnownDeterministicTasksAfterRestart` and `TestScenarioProviderStateSurvivesGatewayReconstruction`.
+
 ## 4. Completion and result delivery
 
 | Failure window | Unsafe behavior | v1 behavior | Evidence |
@@ -49,8 +52,12 @@ Evidence: `TestSubmissionWorkerMapsProviderOutcomes` and `TestReconcilerDistingu
 | Task reaches terminal state but event insert fails | State is complete but no notification exists | Terminal update and outbox insert share one database transaction | `TestTerminalUpdateAndOutboxRedelivery` |
 | Event is delivered but process exits before marking sent | A retry produces a logically new event | Redelivery reuses deterministic `event_id` | `TestOutboxRedeliveryKeepsStableEventID` |
 | Sink is temporarily unavailable | Event is lost | Dispatcher releases the claim and retries later | `TestDispatcherReleasesFailedDeliveryForRetry` |
+| One task or event repeatedly fails | It remains the oldest item and starves all later work | Retry eligibility times rotate failed work behind currently eligible items | `TestPollRetryDoesNotStarveAnotherTask`, `TestFailedOutboxDeliveryDoesNotStarveAnotherEvent`, `TestPollRetryIsFairAndRegressiveObservationIsIgnored` |
+| Provider returns a stale `QUEUED` observation after `RUNNING` | Local lifecycle moves backwards | Completion checks the domain transition under the repository lock | `TestRegressiveProviderObservationDoesNotMoveRunningTaskBackToQueued`, `TestPollRetryIsFairAndRegressiveObservationIsIgnored` |
 
 Delivery is intentionally **at least once**. Consumers must deduplicate by `event_id`; this project does not claim exactly-once delivery.
+
+`make verify` uses a dedicated test database and never truncates the demo database. API tests also assert that create, replay, and read responses omit prompts.
 
 ## 5. What remains outside v1
 
@@ -61,4 +68,3 @@ Delivery is intentionally **at least once**. Consumers must deduplicate by `even
 - cancellation races and callbacks to untrusted URLs.
 
 These are future milestones, not implied capabilities of the current code.
-

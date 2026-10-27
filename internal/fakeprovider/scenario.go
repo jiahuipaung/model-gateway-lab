@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"sync"
 
 	"github.com/jiahuipaung/model-gateway-lab/internal/provider"
 )
@@ -14,27 +13,21 @@ import (
 // remote acceptance, lost submit responses, reconciliation, and asynchronous
 // completion without external credentials.
 type Scenario struct {
-	mu            sync.Mutex
-	requestToTask map[string]string
-	pollCounts    map[string]int
-	failingTask   map[string]bool
+	state ScenarioState
 }
 
 func NewScenario() *Scenario {
-	return &Scenario{
-		requestToTask: make(map[string]string),
-		pollCounts:    make(map[string]int),
-		failingTask:   make(map[string]bool),
-	}
+	return NewScenarioWithState(NewMemoryScenarioState())
 }
 
-func (p *Scenario) Submit(_ context.Context, request provider.SubmitRequest) (provider.SubmitResult, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func NewScenarioWithState(state ScenarioState) *Scenario {
+	return &Scenario{state: state}
+}
+
+func (p *Scenario) Submit(ctx context.Context, request provider.SubmitRequest) (provider.SubmitResult, error) {
 	remoteID := deterministicRemoteID(request.RequestKey)
-	p.requestToTask[request.RequestKey] = remoteID
-	if request.Spec.Model == "demo-failure" {
-		p.failingTask[remoteID] = true
+	if err := p.state.Save(ctx, request.RequestKey, remoteID, request.Spec.Model == "demo-failure"); err != nil {
+		return provider.SubmitResult{}, err
 	}
 	if request.Spec.Model == "demo-lost-response" {
 		return provider.SubmitResult{}, &provider.UnknownOutcomeError{Cause: errors.New("simulated response loss after remote acceptance")}
@@ -42,36 +35,29 @@ func (p *Scenario) Submit(_ context.Context, request provider.SubmitRequest) (pr
 	return provider.SubmitResult{ProviderTaskID: remoteID}, nil
 }
 
-func (p *Scenario) Lookup(_ context.Context, requestKey string) (provider.LookupResult, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	remoteID, ok := p.requestToTask[requestKey]
-	if !ok {
+func (p *Scenario) Lookup(ctx context.Context, requestKey string) (provider.LookupResult, error) {
+	remoteID, found, err := p.state.Find(ctx, requestKey)
+	if err != nil {
+		return provider.LookupResult{}, err
+	}
+	if !found {
 		return provider.LookupResult{Status: provider.LookupAbsent}, nil
 	}
 	return provider.LookupResult{Status: provider.LookupFound, ProviderTaskID: remoteID}, nil
 }
 
-func (p *Scenario) Poll(_ context.Context, providerTaskID string) (provider.PollResult, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if _, known := p.pollCounts[providerTaskID]; !known {
-		known = false
-		for _, remoteID := range p.requestToTask {
-			if remoteID == providerTaskID {
-				known = true
-				break
-			}
-		}
-		if !known {
-			return provider.PollResult{}, &provider.DefiniteError{Code: "task_not_found"}
-		}
+func (p *Scenario) Poll(ctx context.Context, providerTaskID string) (provider.PollResult, error) {
+	pollCount, shouldFail, found, err := p.state.AdvancePoll(ctx, providerTaskID)
+	if err != nil {
+		return provider.PollResult{}, err
 	}
-	p.pollCounts[providerTaskID]++
-	if p.pollCounts[providerTaskID] == 1 {
+	if !found {
+		return provider.PollResult{}, &provider.DefiniteError{Code: "task_not_found"}
+	}
+	if pollCount == 1 {
 		return provider.PollResult{Status: provider.PollRunning}, nil
 	}
-	if p.failingTask[providerTaskID] {
+	if shouldFail {
 		return provider.PollResult{Status: provider.PollFailed, FailureCode: "simulated_generation_failure"}, nil
 	}
 	return provider.PollResult{Status: provider.PollSucceeded, OutputRef: "artifact://demo/" + providerTaskID}, nil

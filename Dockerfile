@@ -11,4 +11,3 @@ USER gateway
 COPY --from=build /out/gateway /usr/local/bin/gateway
 EXPOSE 8080
 ENTRYPOINT ["gateway"]
-

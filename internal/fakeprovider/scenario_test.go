@@ -47,3 +47,25 @@ func TestScenarioProviderPollsRunningThenSucceeded(t *testing.T) {
 		t.Fatalf("second poll = %#v, %v", second, err)
 	}
 }
+
+func TestScenarioProviderCanRecoverKnownDeterministicTasksAfterRestart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	requestKey := "mgw_0123456789abcdef0123456789abcdef"
+	state := fakeprovider.NewMemoryScenarioState()
+	first := fakeprovider.NewScenarioWithState(state)
+	submitted, err := first.Submit(ctx, provider.SubmitRequest{RequestKey: requestKey, Spec: task.Spec{Model: "demo-success"}})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	restarted := fakeprovider.NewScenarioWithState(state)
+	found, err := restarted.Lookup(ctx, requestKey)
+	if err != nil || found.Status != provider.LookupFound || found.ProviderTaskID != submitted.ProviderTaskID {
+		t.Fatalf("lookup after restart = %#v, %v", found, err)
+	}
+	polled, err := restarted.Poll(ctx, submitted.ProviderTaskID)
+	if err != nil || polled.Status != provider.PollRunning {
+		t.Fatalf("poll after restart = %#v, %v", polled, err)
+	}
+}

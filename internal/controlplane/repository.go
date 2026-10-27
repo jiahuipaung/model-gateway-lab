@@ -2,12 +2,22 @@ package controlplane
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"time"
 
 	"github.com/jiahuipaung/model-gateway-lab/internal/task"
 )
+
+func NewClaimToken(workerID string) string {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
+	return workerID + ":" + hex.EncodeToString(nonce[:])
+}
 
 var (
 	ErrInvalidRequest      = errors.New("invalid request")
@@ -27,7 +37,7 @@ type Repository interface {
 	CompletePoll(context.Context, PollCompletion) error
 	ClaimOutbox(context.Context, string, time.Time, time.Duration) (OutboxClaim, bool, error)
 	MarkOutboxSent(context.Context, string, string) error
-	ReleaseOutbox(context.Context, string, string) error
+	ReleaseOutbox(context.Context, string, string, time.Time) error
 }
 
 type SubmissionClaim struct {
@@ -87,6 +97,7 @@ type PollCompletion struct {
 	Outcome     PollOutcome
 	OutputRef   string
 	FailureCode string
+	NextPollAt  time.Time
 }
 
 type Event struct {

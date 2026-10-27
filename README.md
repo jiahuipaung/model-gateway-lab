@@ -25,7 +25,7 @@ flowchart LR
     Dispatch --> Sink[Event Sink]
 ```
 
-The task row is both the lifecycle authority and the durable work intent. Workers claim rows with `FOR UPDATE SKIP LOCKED`, an owner, and an expiry. PostgreSQL—not a process-local queue—is the recovery boundary in v1.
+The task row is both the lifecycle authority and the durable work intent. Workers claim rows with `FOR UPDATE SKIP LOCKED`, a unique per-attempt fencing token, and an expiry. PostgreSQL—not a process-local queue—is the recovery boundary in v1.
 
 ## What is implemented
 
@@ -36,13 +36,17 @@ The task row is both the lifecycle authority and the durable work intent. Worker
 - Repeating the same key and canonical request returns the original task.
 - Reusing the key with different content returns `409 Conflict`.
 - Task reads enforce tenant ownership and return `404` across tenant boundaries.
+- The public response model excludes prompts, idempotency keys, request digests, and provider request keys.
+- Requests for providers that are not configured are rejected before persistence.
 
 ### Lease-safe workers
 
 - Submission, reconciliation, polling, and event delivery use expiring leases.
 - A second worker cannot claim live work.
-- Work becomes claimable after the current lease expires.
-- Completion by an old owner is rejected after takeover.
+- Every acquisition receives a new fencing token, even when two processes use the same logical worker name.
+- An expired submission is moved to `UNKNOWN` for lookup; it is never submitted again until absence is proven.
+- Completion by an older attempt is rejected after takeover.
+- Poll and delivery retries have an eligibility time, so one failing item cannot hold the queue head.
 
 ### `UNKNOWN` as a first-class state
 
@@ -61,7 +65,7 @@ stateDiagram-v2
     RUNNING --> FAILED
 ```
 
-Only a typed definite rejection is treated as rejected. An ambiguous submission becomes `UNKNOWN`. Reconciliation by a stable provider request key must find the original task or prove it absent before the control plane proceeds.
+Only a typed definite rejection is treated as rejected. An ambiguous response or an abandoned `SUBMITTING` attempt becomes `UNKNOWN`. Reconciliation by a stable provider request key must find the original task or prove it absent before the control plane submits again.
 
 ### Durable terminal events
 
@@ -79,7 +83,7 @@ make up
 make demo
 ```
 
-The demo creates two tasks:
+Each demo run creates fresh tasks and separately verifies an idempotent replay:
 
 1. `demo-success` follows the normal submit → poll → success path.
 2. `demo-lost-response` is accepted by the fake provider, loses the response, enters `UNKNOWN`, is found by reconciliation, and then completes normally.
@@ -125,18 +129,23 @@ curl -H 'X-Tenant-ID: demo-team' \
 make verify
 ```
 
-`make verify` checks formatting, runs `go vet`, executes the credential-free unit suite, starts the isolated PostgreSQL service, and runs tagged integration tests.
+`make verify` checks formatting, runs `go vet`, executes the credential-free unit suite, starts a dedicated PostgreSQL test service on port `55433`, and runs tagged integration tests. It does not stop the demo gateway or truncate the demo database. GitHub Actions runs the same unit, race, vet, and PostgreSQL checks for pushes and pull requests.
 
 The tests cover:
 
 | Claim | Executable evidence |
 |---|---|
 | same request is replayed; conflicting content is rejected | service, HTTP, and PostgreSQL integration tests |
-| expired lease can be taken over; stale owner cannot complete | memory and PostgreSQL lease tests |
+| abandoned submission becomes `UNKNOWN`; resubmission waits for proven absence | memory and PostgreSQL recovery tests |
+| every acquisition is fenced; an older attempt cannot complete | memory and PostgreSQL lease tests |
 | lost response becomes `UNKNOWN` and is reconciled | submission and reconciliation tests |
 | terminal state and event are one transaction | PostgreSQL terminal/outbox test |
 | redelivery retains event identity | memory and PostgreSQL outbox tests |
-| startup does not require a real provider credential | deterministic scenario-provider tests and demo |
+| retrying one poll/event does not starve unrelated work | memory and PostgreSQL scheduling tests |
+| a stale `QUEUED` observation cannot regress a `RUNNING` task | memory and PostgreSQL state-transition tests |
+| API responses never return prompts | HTTP create, replay, and read tests |
+| fake-provider tasks remain discoverable across gateway restart | deterministic scenario-provider restart test |
+| startup does not require a real provider credential | scenario-provider tests and demo |
 
 See [Failure Windows and Executable Guarantees](docs/design/failure-windows.md) for the precise failure model and test names.
 
@@ -147,6 +156,8 @@ See [Failure Windows and Executable Guarantees](docs/design/failure-windows.md) 
 **Typed provider outcomes.** Definite rejection, unknown submission, lookup result, and poll result are separate types. State transitions do not depend on parsing error strings.
 
 **Stable internal contract.** Provider fields are mapped into a small task model. Provider state remains an observation; the local task record is authoritative for ownership and delivery.
+
+**Restart-safe local provider.** The demo provider stores its simulated remote-task state in a dedicated PostgreSQL table. Reconstructing the gateway process therefore preserves both `FOUND` and `ABSENT` lookup semantics, poll progress, and failure outcomes without credentials or an external service.
 
 **No exactly-once language.** The outbox closes the “terminal state committed but event missing” window. It does not remove duplicate delivery, so the event ID is part of the consumer contract.
 

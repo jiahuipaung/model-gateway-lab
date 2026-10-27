@@ -46,12 +46,15 @@ type Poller struct {
 	now           func() time.Time
 }
 
+const retryDelay = 500 * time.Millisecond
+
 func NewPoller(repository Repository, providers map[string]provider.Provider, workerID string, leaseDuration time.Duration) *Poller {
 	return &Poller{repository: repository, providers: providers, workerID: workerID, leaseDuration: leaseDuration, now: time.Now}
 }
 
 func (p *Poller) RunOnce(ctx context.Context) (bool, error) {
-	claim, ok, err := p.repository.ClaimPoll(ctx, p.workerID, p.now().UTC(), p.leaseDuration)
+	now := p.now().UTC()
+	claim, ok, err := p.repository.ClaimPoll(ctx, p.workerID, now, p.leaseDuration)
 	if err != nil || !ok {
 		return ok, err
 	}
@@ -61,7 +64,7 @@ func (p *Poller) RunOnce(ctx context.Context) (bool, error) {
 	}
 
 	result, pollErr := client.Poll(ctx, claim.Task.ProviderTaskID)
-	completion := PollCompletion{TaskID: claim.Task.ID, LeaseOwner: claim.LeaseOwner}
+	completion := PollCompletion{TaskID: claim.Task.ID, LeaseOwner: claim.LeaseOwner, NextPollAt: now.Add(retryDelay)}
 	if pollErr != nil {
 		completion.Outcome = PollObservationRetry
 	} else {
@@ -100,12 +103,13 @@ func NewDispatcher(repository Repository, sink EventSink, workerID string, lease
 }
 
 func (d *Dispatcher) RunOnce(ctx context.Context) (bool, error) {
-	claim, ok, err := d.repository.ClaimOutbox(ctx, d.workerID, d.now().UTC(), d.leaseDuration)
+	now := d.now().UTC()
+	claim, ok, err := d.repository.ClaimOutbox(ctx, d.workerID, now, d.leaseDuration)
 	if err != nil || !ok {
 		return ok, err
 	}
 	if err := d.sink.Publish(ctx, claim.Event); err != nil {
-		if releaseErr := d.repository.ReleaseOutbox(ctx, claim.Event.ID, claim.LeaseOwner); releaseErr != nil {
+		if releaseErr := d.repository.ReleaseOutbox(ctx, claim.Event.ID, claim.LeaseOwner, now.Add(retryDelay)); releaseErr != nil {
 			return true, fmt.Errorf("publish failed: %v; release failed: %w", err, releaseErr)
 		}
 		return true, err

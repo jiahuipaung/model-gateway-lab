@@ -82,12 +82,15 @@ Each transition is conditional on the current state and version. A stale worker 
 
 1. `(tenant_id, idempotency_key)` is unique and stores a SHA-256 digest of the canonical request.
 2. Creating the request ledger and task with its durable submit intent is one database transaction.
-3. A command or task claim records `lease_owner` and `lease_expires_at`; only the current owner may complete it.
+3. A claim records a unique per-attempt fencing token and `lease_expires_at`; only that attempt may complete it.
 4. A submission timeout after bytes may have reached the provider is `UNKNOWN`, never a definite failure.
 5. Reconciliation uses a stable `provider_request_key`. “Found” confirms the task; “proven absent” requeues it; “inconclusive” keeps it unknown.
 6. A terminal task update and its outbox event are one transaction.
 7. Event IDs are deterministic per task terminal transition. Redelivery reuses the same event ID.
 8. Tenant ownership is checked on every read.
+9. An expired `SUBMITTING` attempt becomes `UNKNOWN` and is reconciled before any resubmission.
+10. Poll and outbox retries use eligibility times so failing work cannot starve unrelated work.
+11. Public responses exclude prompts and internal idempotency/reconciliation keys.
 
 ## 7. Provider contract
 
@@ -106,10 +109,15 @@ Provider errors are typed as `DefiniteError`, `UnknownOutcomeError`, or temporar
 - duplicate create with the same body;
 - idempotency-key conflict with a different body;
 - worker crash followed by lease expiry and takeover;
+- worker crash after a possible remote submit, followed by reconciliation rather than blind retry;
 - provider acceptance followed by a lost submit response;
 - reconciliation found / absent / inconclusive;
 - duplicate result delivery after “send succeeded, mark sent failed”;
 - stale worker completion after another worker owns the lease;
+- identical logical worker names receiving distinct fencing tokens;
+- retry fairness across multiple tasks and events;
+- stale provider observations attempting to regress execution state;
+- gateway restart with unfinished deterministic-provider work;
 - cross-tenant task lookup.
 
 ## 9. Non-goals

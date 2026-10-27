@@ -31,8 +31,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     unknown_lease_expires_at TIMESTAMPTZ,
     poll_lease_owner TEXT,
     poll_lease_expires_at TIMESTAMPTZ,
+    poll_available_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
     UNIQUE (tenant_id, idempotency_key)
 );
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS poll_available_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity';
 
 CREATE INDEX IF NOT EXISTS tasks_submit_claim_idx
     ON tasks (submission_state, submit_lease_expires_at, created_at);
@@ -40,6 +43,8 @@ CREATE INDEX IF NOT EXISTS tasks_unknown_claim_idx
     ON tasks (submission_state, unknown_lease_expires_at, created_at);
 CREATE INDEX IF NOT EXISTS tasks_poll_claim_idx
     ON tasks (submission_state, execution_state, poll_lease_expires_at, created_at);
+CREATE INDEX IF NOT EXISTS tasks_poll_ready_claim_idx
+    ON tasks (submission_state, execution_state, poll_available_at, poll_lease_expires_at, updated_at);
 
 CREATE TABLE IF NOT EXISTS outbox_events (
     event_id TEXT PRIMARY KEY,
@@ -51,10 +56,21 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     lease_owner TEXT,
     lease_expires_at TIMESTAMPTZ,
     attempts INTEGER NOT NULL DEFAULT 0,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
     created_at TIMESTAMPTZ NOT NULL,
     sent_at TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS outbox_claim_idx
-    ON outbox_events (status, lease_expires_at, created_at);
+ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity';
 
+DROP INDEX IF EXISTS outbox_claim_idx;
+CREATE INDEX IF NOT EXISTS outbox_ready_claim_idx
+    ON outbox_events (status, available_at, lease_expires_at, created_at);
+
+CREATE TABLE IF NOT EXISTS fake_provider_tasks (
+    request_key TEXT PRIMARY KEY,
+    remote_id TEXT NOT NULL UNIQUE,
+    should_fail BOOLEAN NOT NULL,
+    poll_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

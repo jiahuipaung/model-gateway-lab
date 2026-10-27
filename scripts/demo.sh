@@ -45,17 +45,24 @@ wait_for_terminal() {
 
 wait_for_gateway
 
-normal_create="$(create_task demo-normal-v1 demo-success)"
-unknown_create="$(create_task demo-unknown-v1 demo-lost-response)"
+run_id="$(date +%s)-$$"
+normal_key="demo-normal-${run_id}"
+unknown_key="demo-unknown-${run_id}"
+normal_create="$(create_task "$normal_key" demo-success)"
+normal_replay="$(create_task "$normal_key" demo-success)"
+unknown_create="$(create_task "$unknown_key" demo-lost-response)"
 normal_id="$(printf '%s' "$normal_create" | jq -r '.task.id')"
 unknown_id="$(printf '%s' "$unknown_create" | jq -r '.task.id')"
+
+test "$(printf '%s' "$normal_replay" | jq -r '.replayed')" = "true"
+test "$(printf '%s' "$normal_replay" | jq -r '.task.id')" = "$normal_id"
 
 normal_result="$(wait_for_terminal "$normal_id")"
 unknown_result="$(wait_for_terminal "$unknown_id")"
 
 printf '%s\n' "$normal_result" | jq '{scenario:"normal", task_id:.task.id, submission:.task.submission_state, execution:.task.execution_state, output:.task.output_ref}'
+printf '%s\n' "$normal_replay" | jq '{scenario:"idempotent-replay", task_id:.task.id, replayed:.replayed}'
 printf '%s\n' "$unknown_result" | jq '{scenario:"lost-response-reconciled", task_id:.task.id, submission:.task.submission_state, execution:.task.execution_state, output:.task.output_ref}'
 
 test "$(printf '%s' "$normal_result" | jq -r '.task.execution_state')" = "SUCCEEDED"
 test "$(printf '%s' "$unknown_result" | jq -r '.task.execution_state')" = "SUCCEEDED"
-

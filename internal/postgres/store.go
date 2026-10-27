@@ -130,10 +130,10 @@ func (s *Store) GetTask(ctx context.Context, tenantID, taskID string) (task.Task
 }
 
 func (s *Store) ClaimSubmission(ctx context.Context, owner string, now time.Time, ttl time.Duration) (controlplane.SubmissionClaim, bool, error) {
+	token := controlplane.NewClaimToken(owner)
 	query := `WITH candidate AS (
         SELECT id FROM tasks
         WHERE submission_state = 'PENDING'
-           OR (submission_state = 'SUBMITTING' AND submit_lease_expires_at <= $2)
         ORDER BY created_at, id
         FOR UPDATE SKIP LOCKED LIMIT 1
     )
@@ -141,14 +141,14 @@ func (s *Store) ClaimSubmission(ctx context.Context, owner string, now time.Time
         submit_lease_expires_at = $3, version = version + 1, updated_at = $2
     FROM candidate c WHERE t.id = c.id
     RETURNING ` + taskColumns("t")
-	record, err := scanTask(s.pool.QueryRow(ctx, query, owner, now, now.Add(ttl)))
+	record, err := scanTask(s.pool.QueryRow(ctx, query, token, now, now.Add(ttl)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return controlplane.SubmissionClaim{}, false, nil
 	}
 	if err != nil {
 		return controlplane.SubmissionClaim{}, false, fmt.Errorf("claim submission: %w", err)
 	}
-	return controlplane.SubmissionClaim{Task: record, LeaseOwner: owner}, true, nil
+	return controlplane.SubmissionClaim{Task: record, LeaseOwner: token}, true, nil
 }
 
 func (s *Store) CompleteSubmission(ctx context.Context, completion controlplane.SubmissionCompletion) error {
@@ -186,24 +186,33 @@ func (s *Store) CompleteSubmission(ctx context.Context, completion controlplane.
 }
 
 func (s *Store) ClaimUnknown(ctx context.Context, owner string, now time.Time, ttl time.Duration) (controlplane.SubmissionClaim, bool, error) {
+	token := controlplane.NewClaimToken(owner)
 	query := `WITH candidate AS (
         SELECT id FROM tasks
-        WHERE submission_state = 'UNKNOWN'
-          AND (unknown_lease_expires_at IS NULL OR unknown_lease_expires_at <= $2)
+        WHERE (submission_state = 'UNKNOWN'
+          AND (unknown_lease_expires_at IS NULL OR unknown_lease_expires_at <= $2))
+           OR (submission_state = 'SUBMITTING' AND submit_lease_expires_at <= $2)
         ORDER BY updated_at, id
         FOR UPDATE SKIP LOCKED LIMIT 1
     )
-    UPDATE tasks t SET unknown_lease_owner = $1, unknown_lease_expires_at = $3
+    UPDATE tasks t SET
+        submission_state = 'UNKNOWN',
+        submit_lease_owner = NULL,
+        submit_lease_expires_at = NULL,
+        unknown_lease_owner = $1,
+        unknown_lease_expires_at = $3,
+        version = version + CASE WHEN t.submission_state = 'SUBMITTING' THEN 1 ELSE 0 END,
+        updated_at = CASE WHEN t.submission_state = 'SUBMITTING' THEN $2 ELSE t.updated_at END
     FROM candidate c WHERE t.id = c.id
     RETURNING ` + taskColumns("t")
-	record, err := scanTask(s.pool.QueryRow(ctx, query, owner, now, now.Add(ttl)))
+	record, err := scanTask(s.pool.QueryRow(ctx, query, token, now, now.Add(ttl)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return controlplane.SubmissionClaim{}, false, nil
 	}
 	if err != nil {
 		return controlplane.SubmissionClaim{}, false, fmt.Errorf("claim unknown submission: %w", err)
 	}
-	return controlplane.SubmissionClaim{Task: record, LeaseOwner: owner}, true, nil
+	return controlplane.SubmissionClaim{Task: record, LeaseOwner: token}, true, nil
 }
 
 func (s *Store) ResolveUnknown(ctx context.Context, resolution controlplane.UnknownResolution) error {
@@ -240,25 +249,27 @@ func (s *Store) ResolveUnknown(ctx context.Context, resolution controlplane.Unkn
 }
 
 func (s *Store) ClaimPoll(ctx context.Context, owner string, now time.Time, ttl time.Duration) (controlplane.PollClaim, bool, error) {
+	token := controlplane.NewClaimToken(owner)
 	query := `WITH candidate AS (
         SELECT id FROM tasks
         WHERE submission_state = 'CONFIRMED'
           AND execution_state IN ('QUEUED', 'RUNNING')
           AND (poll_lease_expires_at IS NULL OR poll_lease_expires_at <= $2)
-        ORDER BY updated_at, id
+          AND poll_available_at <= $2
+        ORDER BY poll_available_at, updated_at, id
         FOR UPDATE SKIP LOCKED LIMIT 1
     )
     UPDATE tasks t SET poll_lease_owner = $1, poll_lease_expires_at = $3
     FROM candidate c WHERE t.id = c.id
     RETURNING ` + taskColumns("t")
-	record, err := scanTask(s.pool.QueryRow(ctx, query, owner, now, now.Add(ttl)))
+	record, err := scanTask(s.pool.QueryRow(ctx, query, token, now, now.Add(ttl)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return controlplane.PollClaim{}, false, nil
 	}
 	if err != nil {
 		return controlplane.PollClaim{}, false, fmt.Errorf("claim poll: %w", err)
 	}
-	return controlplane.PollClaim{Task: record, LeaseOwner: owner}, true, nil
+	return controlplane.PollClaim{Task: record, LeaseOwner: token}, true, nil
 }
 
 func (s *Store) CompletePoll(ctx context.Context, completion controlplane.PollCompletion) error {
@@ -278,30 +289,41 @@ func (s *Store) CompletePoll(ctx context.Context, completion controlplane.PollCo
 		return fmt.Errorf("lock polled task: %w", err)
 	}
 	if completion.Outcome == controlplane.PollObservationRetry {
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET poll_lease_owner = NULL, poll_lease_expires_at = NULL WHERE id = $1`, completion.TaskID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET poll_lease_owner = NULL, poll_lease_expires_at = NULL,
+            poll_available_at = $2 WHERE id = $1`, completion.TaskID, completion.NextPollAt); err != nil {
 			return fmt.Errorf("release poll lease: %w", err)
 		}
 		return commit(ctx, tx)
 	}
 
+	var nextState task.ExecutionState
 	switch completion.Outcome {
 	case controlplane.PollObservedQueued:
-		record.ExecutionState = task.ExecutionQueued
+		nextState = task.ExecutionQueued
 	case controlplane.PollObservedRunning:
-		record.ExecutionState = task.ExecutionRunning
+		nextState = task.ExecutionRunning
 	case controlplane.PollObservedSucceeded:
-		record.ExecutionState, record.OutputRef = task.ExecutionSucceeded, completion.OutputRef
+		nextState, record.OutputRef = task.ExecutionSucceeded, completion.OutputRef
 	case controlplane.PollObservedFailed:
-		record.ExecutionState, record.FailureCode = task.ExecutionFailed, completion.FailureCode
+		nextState, record.FailureCode = task.ExecutionFailed, completion.FailureCode
 	default:
 		return controlplane.ErrInvalidRequest
 	}
+	if !record.ExecutionState.CanTransitionTo(nextState) {
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET poll_lease_owner = NULL, poll_lease_expires_at = NULL,
+            poll_available_at = $2 WHERE id = $1`, completion.TaskID, completion.NextPollAt); err != nil {
+			return fmt.Errorf("release regressive poll observation: %w", err)
+		}
+		return commit(ctx, tx)
+	}
+	record.ExecutionState = nextState
 	record.UpdatedAt = time.Now().UTC()
 	tag, err := tx.Exec(ctx, `
         UPDATE tasks SET execution_state = $1, output_ref = NULLIF($2, ''), failure_code = NULLIF($3, ''),
-            poll_lease_owner = NULL, poll_lease_expires_at = NULL, version = version + 1, updated_at = $4
+            poll_lease_owner = NULL, poll_lease_expires_at = NULL, poll_available_at = $7,
+            version = version + 1, updated_at = $4
         WHERE id = $5 AND poll_lease_owner = $6`, record.ExecutionState, record.OutputRef,
-		record.FailureCode, record.UpdatedAt, record.ID, completion.LeaseOwner)
+		record.FailureCode, record.UpdatedAt, record.ID, completion.LeaseOwner, completion.NextPollAt)
 	if err != nil {
 		return fmt.Errorf("update polled task: %w", err)
 	}
@@ -321,19 +343,21 @@ func (s *Store) CompletePoll(ctx context.Context, completion controlplane.PollCo
 }
 
 func (s *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time, ttl time.Duration) (controlplane.OutboxClaim, bool, error) {
+	token := controlplane.NewClaimToken(owner)
 	row := s.pool.QueryRow(ctx, `WITH candidate AS (
         SELECT event_id FROM outbox_events
-        WHERE status = 'PENDING' OR (status = 'SENDING' AND lease_expires_at <= $2)
-        ORDER BY created_at, event_id
+        WHERE available_at <= $2
+          AND (status = 'PENDING' OR (status = 'SENDING' AND lease_expires_at <= $2))
+        ORDER BY available_at, created_at, event_id
         FOR UPDATE SKIP LOCKED LIMIT 1
     )
     UPDATE outbox_events o SET status = 'SENDING', lease_owner = $1,
         lease_expires_at = $3, attempts = attempts + 1
     FROM candidate c WHERE o.event_id = c.event_id
     RETURNING o.event_id, o.event_type, o.task_id, o.tenant_id, o.payload, o.created_at, o.attempts`,
-		owner, now, now.Add(ttl))
+		token, now, now.Add(ttl))
 	var claim controlplane.OutboxClaim
-	claim.LeaseOwner = owner
+	claim.LeaseOwner = token
 	if err := row.Scan(&claim.Event.ID, &claim.Event.Type, &claim.Event.TaskID, &claim.Event.TenantID,
 		&claim.Event.Payload, &claim.Event.CreatedAt, &claim.Attempts); errors.Is(err, pgx.ErrNoRows) {
 		return controlplane.OutboxClaim{}, false, nil
@@ -356,10 +380,10 @@ func (s *Store) MarkOutboxSent(ctx context.Context, eventID, owner string) error
 	return nil
 }
 
-func (s *Store) ReleaseOutbox(ctx context.Context, eventID, owner string) error {
+func (s *Store) ReleaseOutbox(ctx context.Context, eventID, owner string, retryAt time.Time) error {
 	tag, err := s.pool.Exec(ctx, `
-        UPDATE outbox_events SET status = 'PENDING', lease_owner = NULL, lease_expires_at = NULL
-        WHERE event_id = $1 AND status = 'SENDING' AND lease_owner = $2`, eventID, owner)
+        UPDATE outbox_events SET status = 'PENDING', lease_owner = NULL, lease_expires_at = NULL, available_at = $3
+        WHERE event_id = $1 AND status = 'SENDING' AND lease_owner = $2`, eventID, owner, retryAt)
 	if err != nil {
 		return fmt.Errorf("release outbox: %w", err)
 	}

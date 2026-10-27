@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/jiahuipaung/model-gateway-lab/internal/controlplane"
@@ -22,6 +23,9 @@ func TestCreateTaskHTTPAndReplay(t *testing.T) {
 	if first.Code != http.StatusAccepted {
 		t.Fatalf("first status = %d, body = %s", first.Code, first.Body.String())
 	}
+	if strings.Contains(first.Body.String(), "a paper boat") || strings.Contains(first.Body.String(), `"prompt"`) {
+		t.Fatalf("create response leaked prompt: %s", first.Body.String())
+	}
 	var firstResponse struct {
 		Task struct {
 			ID string `json:"id"`
@@ -33,7 +37,8 @@ func TestCreateTaskHTTPAndReplay(t *testing.T) {
 		t.Fatalf("unexpected first response: %#v", firstResponse)
 	}
 
-	replay := request(t, handler, http.MethodPost, "/v1/tasks", "team-a", "request-1", body)
+	replayBody := []byte(`{"prompt":"a paper boat","operation":"text-to-video","model":"video-basic","provider":"fake-a"}`)
+	replay := request(t, handler, http.MethodPost, "/v1/tasks", "team-a", "request-1", replayBody)
 	if replay.Code != http.StatusAccepted {
 		t.Fatalf("replay status = %d, body = %s", replay.Code, replay.Body.String())
 	}
@@ -46,6 +51,9 @@ func TestCreateTaskHTTPAndReplay(t *testing.T) {
 	decodeResponse(t, replay, &replayResponse)
 	if !replayResponse.Replayed || replayResponse.Task.ID != firstResponse.Task.ID {
 		t.Fatalf("unexpected replay response: %#v", replayResponse)
+	}
+	if strings.Contains(replay.Body.String(), `"prompt"`) {
+		t.Fatalf("replay response leaked prompt: %s", replay.Body.String())
 	}
 }
 
@@ -64,6 +72,11 @@ func TestCreateTaskHTTPRejectsConflictAndUnknownFields(t *testing.T) {
 	if unknown.Code != http.StatusBadRequest {
 		t.Fatalf("unknown-field status = %d, body = %s", unknown.Code, unknown.Body.String())
 	}
+	validAfterRejected := request(t, handler, http.MethodPost, "/v1/tasks", "team-a", "request-2",
+		[]byte(`{"provider":"fake-a","model":"video-basic","operation":"text-to-video","prompt":"one"}`))
+	if validAfterRejected.Code != http.StatusAccepted || strings.Contains(validAfterRejected.Body.String(), `"replayed":true`) {
+		t.Fatalf("rejected request created state: status=%d body=%s", validAfterRejected.Code, validAfterRejected.Body.String())
+	}
 }
 
 func TestGetTaskHTTPIsTenantIsolated(t *testing.T) {
@@ -77,6 +90,10 @@ func TestGetTaskHTTPIsTenantIsolated(t *testing.T) {
 		} `json:"task"`
 	}
 	decodeResponse(t, created, &response)
+	read := request(t, handler, http.MethodGet, "/v1/tasks/"+response.Task.ID, "team-a", "", nil)
+	if read.Code != http.StatusOK || strings.Contains(read.Body.String(), `"prompt"`) || strings.Contains(read.Body.String(), "one") {
+		t.Fatalf("read response leaked prompt or failed: status=%d body=%s", read.Code, read.Body.String())
+	}
 
 	missing := request(t, handler, http.MethodGet, "/v1/tasks/"+response.Task.ID, "team-b", "", nil)
 	if missing.Code != http.StatusNotFound {
@@ -94,8 +111,17 @@ func TestCreateTaskHTTPRejectsInvalidHeaders(t *testing.T) {
 	}
 }
 
+func TestCreateTaskHTTPRejectsUnconfiguredProvider(t *testing.T) {
+	t.Parallel()
+	response := request(t, newHandler(), http.MethodPost, "/v1/tasks", "team-a", "request-unsupported",
+		[]byte(`{"provider":"fake-typo","model":"video-basic","operation":"text-to-video","prompt":"one"}`))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
 func newHandler() http.Handler {
-	return httpapi.NewHandler(controlplane.NewService(memory.NewStore()))
+	return httpapi.NewHandler(controlplane.NewService(memory.NewStore(), "fake-a"))
 }
 
 func request(t *testing.T, handler http.Handler, method, path, tenant, key string, body []byte) *httptest.ResponseRecorder {

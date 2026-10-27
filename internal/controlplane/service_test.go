@@ -14,7 +14,7 @@ import (
 func TestCreateTaskReplaysSameRequest(t *testing.T) {
 	t.Parallel()
 
-	svc := controlplane.NewService(memory.NewStore())
+	svc := controlplane.NewService(memory.NewStore(), "fake-a")
 	input := validCreateInput()
 
 	first, err := svc.CreateTask(context.Background(), input)
@@ -37,7 +37,7 @@ func TestCreateTaskReplaysSameRequest(t *testing.T) {
 func TestCreateTaskRejectsIdempotencyConflict(t *testing.T) {
 	t.Parallel()
 
-	svc := controlplane.NewService(memory.NewStore())
+	svc := controlplane.NewService(memory.NewStore(), "fake-a")
 	input := validCreateInput()
 	if _, err := svc.CreateTask(context.Background(), input); err != nil {
 		t.Fatalf("first create: %v", err)
@@ -70,7 +70,7 @@ func TestCreateTaskValidatesTenantAndIdempotencyKey(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			svc := controlplane.NewService(memory.NewStore())
+			svc := controlplane.NewService(memory.NewStore(), "fake-a")
 			input := validCreateInput()
 			input.TenantID = tt.tenant
 			input.IdempotencyKey = tt.key
@@ -86,7 +86,7 @@ func TestCreateTaskValidatesTenantAndIdempotencyKey(t *testing.T) {
 func TestGetTaskHidesCrossTenantTask(t *testing.T) {
 	t.Parallel()
 
-	svc := controlplane.NewService(memory.NewStore())
+	svc := controlplane.NewService(memory.NewStore(), "fake-a")
 	created, err := svc.CreateTask(context.Background(), validCreateInput())
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -95,6 +95,21 @@ func TestGetTaskHidesCrossTenantTask(t *testing.T) {
 	_, err = svc.GetTask(context.Background(), "another-tenant", created.Task.ID)
 	if !errors.Is(err, controlplane.ErrNotFound) {
 		t.Fatalf("cross-tenant error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCreateTaskRejectsUnconfiguredProviderBeforePersistence(t *testing.T) {
+	t.Parallel()
+	store := memory.NewStore()
+	svc := controlplane.NewService(store, "fake-a")
+	input := validCreateInput()
+	input.Spec.Provider = "fake-typo"
+
+	if _, err := svc.CreateTask(context.Background(), input); !errors.Is(err, controlplane.ErrInvalidRequest) {
+		t.Fatalf("error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := svc.GetTask(context.Background(), input.TenantID, "anything"); !errors.Is(err, controlplane.ErrNotFound) {
+		t.Fatalf("invalid request created state: %v", err)
 	}
 }
 

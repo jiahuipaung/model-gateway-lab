@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/jiahuipaung/model-gateway-lab/internal/controlplane"
 	"github.com/jiahuipaung/model-gateway-lab/internal/task"
@@ -56,7 +57,10 @@ func (h *handler) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, result)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"task":     taskResponseFrom(result.Task),
+		"replayed": result.Replayed,
+	})
 }
 
 func (h *handler) getTask(w http.ResponseWriter, r *http.Request) {
@@ -69,7 +73,33 @@ func (h *handler) getTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "task could not be read")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]task.Task{"task": record})
+	writeJSON(w, http.StatusOK, map[string]taskResponse{"task": taskResponseFrom(record)})
+}
+
+type taskResponse struct {
+	ID              string               `json:"id"`
+	TenantID        string               `json:"tenant_id"`
+	Provider        string               `json:"provider"`
+	Model           string               `json:"model"`
+	Operation       string               `json:"operation"`
+	SubmissionState task.SubmissionState `json:"submission_state"`
+	ExecutionState  task.ExecutionState  `json:"execution_state"`
+	ProviderTaskID  string               `json:"provider_task_id,omitempty"`
+	OutputRef       string               `json:"output_ref,omitempty"`
+	FailureCode     string               `json:"failure_code,omitempty"`
+	Version         int64                `json:"version"`
+	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at"`
+}
+
+func taskResponseFrom(record task.Task) taskResponse {
+	return taskResponse{
+		ID: record.ID, TenantID: record.TenantID,
+		Provider: record.Spec.Provider, Model: record.Spec.Model, Operation: record.Spec.Operation,
+		SubmissionState: record.SubmissionState, ExecutionState: record.ExecutionState,
+		ProviderTaskID: record.ProviderTaskID, OutputRef: record.OutputRef, FailureCode: record.FailureCode,
+		Version: record.Version, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
